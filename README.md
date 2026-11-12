@@ -188,8 +188,35 @@ An example auth hash available in `request.env['omniauth.auth']`:
 
 ```sh
 bundle install
-bundle exec rake   # runs the specs with a minimum-coverage gate
+bundle exec rake   # runs the specs; every line of lib/ must be covered
 ```
 
 The test suite stubs all HTTP with WebMock; no LINE credentials are
-needed. CI runs the suite on Ruby 3.1 through 3.4.
+needed. CI runs the suite on Ruby 3.1 through 4.0 and on ruby-head
+(which may fail without failing the build), and once more against the
+oldest dependency versions the gemspec admits:
+
+```sh
+BUNDLE_GEMFILE=gemfiles/minimum.gemfile bundle install
+BUNDLE_GEMFILE=gemfiles/minimum.gemfile bundle exec rake
+```
+
+## Releasing
+
+Releases are published by the `Release` workflow through RubyGems
+[trusted publishing](https://guides.rubygems.org/trusted-publishing/);
+no API key is stored in the repository, and nobody runs `gem push` by
+hand.
+
+1. Set the version in `lib/omniauth/line_oidc/version.rb` and move the
+   changelog's "Unreleased" entries under that version. Merge to `master`.
+2. Tag that commit `v<version>` and push the tag.
+3. The workflow checks that the tag matches the gem's version and that
+   the commit is on `master`, runs the specs, then builds and pushes the
+   gem.
+
+One-time setup on RubyGems.org, by an owner of the gem: a trusted
+publisher for repository `momiji-rs/omniauth-line-oidc`, workflow
+`release.yml`, environment `release`. Before the first release the gem
+does not exist yet, so this is created as a pending trusted publisher
+under the owner's profile.

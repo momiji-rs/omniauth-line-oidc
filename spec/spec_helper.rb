@@ -2,7 +2,12 @@ $:.unshift File.expand_path('..', __FILE__)
 $:.unshift File.expand_path('../../lib', __FILE__)
 require 'simplecov'
 SimpleCov.start do
-  minimum_coverage(75.00)
+  # Only the gem's own code counts; an alternate BUNDLE_PATH inside the
+  # checkout would otherwise be measured as well. Newer SimpleCov renamed
+  # `add_filter` to `skip`; Ruby 3.1 resolves a version without it.
+  lib_dir = File.expand_path('../lib', __dir__)
+  send(respond_to?(:skip) ? :skip : :add_filter) { |source| !source.filename.start_with?(lib_dir) }
+  minimum_coverage(100)
 end
 require 'rspec'
 require 'rack/test'
