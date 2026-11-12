@@ -6,6 +6,25 @@ All notable changes to this gem are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-12
+
+1.0.0 could overflow a 4 KB cookie session: with its defaults, five
+unfinished sign-ins raised `ActionDispatch::Cookies::CookieOverflow` in a
+Rails app.
+
+### Changed
+
+- PKCE is off unless `pkce: true` is set. `omniauth-oauth2` keeps a
+  128-character verifier in the session for each of the last five
+  sign-ins, more than a cookie session has room for. Turn it on when
+  sessions are stored on the server.
+- The nonce no longer takes session space per sign-in. The session holds
+  one secret and an eight-character fingerprint of each sign-in under
+  way, about 110 bytes in all; a sign-in's nonce is derived from the
+  secret and its `state`. The session key is `omniauth.line`
+  (`omniauth.line.nonces` in 1.0.0). A sign-in in flight across the
+  upgrade is verified without a nonce.
+
 ## [1.0.0] - 2026-11-12
 
 First release under the name `omniauth-line-oidc`. The gem continues the
