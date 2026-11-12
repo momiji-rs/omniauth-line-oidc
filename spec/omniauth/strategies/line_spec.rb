@@ -52,7 +52,7 @@ describe OmniAuth::Strategies::Line do
 
   describe 'authorize params' do
     it 'should forward LINE-specific options to the authorize request' do
-      @options = { prompt: 'consent', bot_prompt: 'normal', ui_locales: 'zh-TW' }
+      @options = { prompt: 'consent', bot_prompt: 'normal', ui_locales: 'zh-TW', redirect_uri: 'https://app.test/auth/line/callback' }
       allow(subject).to receive(:session).and_return({})
       params = subject.authorize_params
       expect(params[:prompt]).to eq('consent')
@@ -61,7 +61,7 @@ describe OmniAuth::Strategies::Line do
     end
 
     it 'should not forward options outside the whitelist' do
-      @options = { channel_secret: 'super-secret' }
+      @options = { channel_secret: 'super-secret', redirect_uri: 'https://app.test/auth/line/callback' }
       allow(subject).to receive(:session).and_return({})
       expect(subject.authorize_params).not_to have_key(:channel_secret)
     end
