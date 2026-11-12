@@ -6,6 +6,8 @@ All notable changes to this gem are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-12
+
 First release under the name `omniauth-line-oidc`. The gem continues the
 `omniauth-line` strategy (last released as 0.1.0 in 2021) and keeps its
 provider name, `:line`, so an app can switch by changing its Gemfile.

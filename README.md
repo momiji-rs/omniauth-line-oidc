@@ -205,8 +205,8 @@ BUNDLE_GEMFILE=gemfiles/minimum.gemfile bundle exec rake
 
 Releases are published by the `Release` workflow through RubyGems
 [trusted publishing](https://guides.rubygems.org/trusted-publishing/);
-no API key is stored in the repository, and nobody runs `gem push` by
-hand.
+no API key is stored in the repository. Only 1.0.0, which created the
+gem on RubyGems.org, was pushed by hand.
 
 1. Set the version in `lib/omniauth/line_oidc/version.rb` and move the
    changelog's "Unreleased" entries under that version. Merge to `master`.
@@ -217,6 +217,5 @@ hand.
 
 One-time setup on RubyGems.org, by an owner of the gem: a trusted
 publisher for repository `momiji-rs/omniauth-line-oidc`, workflow
-`release.yml`, environment `release`. Before the first release the gem
-does not exist yet, so this is created as a pending trusted publisher
-under the owner's profile.
+`release.yml`, environment `release`, added on the gem's "Trusted
+publishers" page.
