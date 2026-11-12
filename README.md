@@ -1,19 +1,36 @@
-# OmniAuth Line
+# omniauth-line-oidc
 
-[![CI](https://github.com/kaikhq/omniauth-line/actions/workflows/ci.yml/badge.svg)](https://github.com/kaikhq/omniauth-line/actions/workflows/ci.yml)
+[![CI](https://github.com/momiji-rs/omniauth-line-oidc/actions/workflows/ci.yml/badge.svg)](https://github.com/momiji-rs/omniauth-line-oidc/actions/workflows/ci.yml)
 
 LINE Login v2.1 (OAuth 2.0 / OpenID Connect) strategy for OmniAuth.
 
 See the LINE Login docs for details:
 https://developers.line.biz/en/docs/line-login/integrate-line-login/
 
+This gem continues the `omniauth-line` strategy, which has had no release
+since 2021. It registers the same provider name, `:line`.
+
 ## Using This Strategy
 
 First start by adding this gem to your Gemfile:
 
 ```ruby
-gem 'omniauth-line'
+gem 'omniauth-line-oidc'
 ```
+
+### Switching from `omniauth-line`
+
+Replace the gem in your Gemfile; the provider name, the callback path
+(`/auth/line/callback`) and the auth hash keys are the same. Two things to
+check:
+
+- If you set the callback URL explicitly, the option is now `redirect_uri`
+  (`omniauth-line` read `callback_url`).
+- Do not keep both gems in one bundle: both define
+  `OmniAuth::Strategies::Line`.
+
+See the [changelog](CHANGELOG.md) for everything that differs from
+`omniauth-line` 0.1.0.
 
 Next, tell OmniAuth about this provider. For a Rails app, your
 `config/initializers/omniauth.rb` file should look like this:

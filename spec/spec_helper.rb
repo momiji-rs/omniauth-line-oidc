@@ -9,7 +9,7 @@ require 'rack/test'
 require 'webmock/rspec'
 require 'vcr'
 require 'omniauth'
-require 'omniauth-line'
+require 'omniauth-line-oidc'
 
 VCR.configure do |config|
   config.cassette_library_dir = File.expand_path('cassettes', __dir__)
