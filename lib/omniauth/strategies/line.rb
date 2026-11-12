@@ -1,12 +1,34 @@
+# frozen_string_literal: true
+
 require 'omniauth-oauth2'
 require 'json'
 require 'net/http'
+require 'securerandom'
 
 module OmniAuth
   module Strategies
+    # LINE Login v2.1.
+    #
+    # The user is identified by the profile API, called with the access token
+    # this sign-in was just issued. The ID token adds claims the profile API
+    # does not have (the email above all). Its claims are used only after
+    # LINE's verify endpoint has accepted the token, together with the nonce
+    # this strategy sent; a token that cannot be verified contributes nothing
+    # and the sign-in carries on without those claims.
     class Line < OmniAuth::Strategies::OAuth2
+      VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify'
+      NONCE_SESSION_KEY = 'omniauth.line.nonces'
+      # Sign-ins a browser session can have under way at once, each with its
+      # own nonce; the oldest is dropped beyond this.
+      MAX_STORED_NONCES = 5
+
       option :name, 'line'
       option :scope, 'profile openid'
+
+      # LINE supports PKCE with S256 only, which is what omniauth-oauth2 sends.
+      # Set `pkce: false` when the callback is handled without the session
+      # that started the sign-in, since the verifier lives in that session.
+      option :pkce, true
 
       # omniauth-oauth2 only forwards options named here to the authorize
       # URL; anything else set on the strategy is silently dropped.
@@ -33,54 +55,55 @@ module OmniAuth
         auth_scheme: :request_body
       }
 
-      uid { raw_info['userId'] }
+      uid do
+        ensure_id_token_is_for_this_user!
+        raw_info['userId']
+      end
 
       info do
         {
-          name:        raw_info['displayName'],
-          image:       raw_info['pictureUrl'],
+          name: raw_info['displayName'],
+          image: raw_info['pictureUrl'],
           description: raw_info['statusMessage'],
-          email:       raw_info['email']
+          email: email
         }
       end
 
       extra do
-        hash = {}
-        hash[:id_token] = access_token['id_token'] if access_token['id_token']
-
+        hash = { raw_info: raw_info }
+        hash[:id_token] = id_token if id_token
+        hash[:id_token_claims] = id_token_claims unless id_token_claims.empty?
+        hash[:friendship_status_changed] = friendship_status_changed unless friendship_status_changed.nil?
         hash
       end
 
-      # LINE returns the email claim only inside the ID token (email scope),
-      # never from the profile endpoint; the verify endpoint decodes it.
-      # Email is best-effort: any verify failure degrades to nil instead of
-      # failing the whole login.
-      def email
-        id_token = access_token['id_token']
-        return nil unless id_token
+      # A nonce ties the ID token to this sign-in: it is sent with the
+      # authorization request, LINE copies it into the ID token, and the
+      # verify call later states which nonce the token must carry.
+      def authorize_params
+        super.tap do |params|
+          next unless openid_scope?(params[:scope])
 
-        response = verify_id_token(id_token)
-        payload = JSON.parse(response.body)
-        unless response.is_a?(Net::HTTPSuccess)
-          log :warn, "ID token verify failed (HTTP #{response.code}): #{payload['error_description'] || payload['error']}"
-          return nil
+          params[:nonce] ||= SecureRandom.hex(16)
+          remember_nonce(params[:state], params[:nonce])
         end
-        payload['email']
-      rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ETIMEDOUT => e
-        log :warn, "ID token verify timed out (#{e.class})"
-        nil
-      rescue JSON::ParserError
-        log :warn, 'ID token verify returned a non-JSON body'
-        nil
+      end
+
+      # LINE returns the email claim only inside the ID token (email scope),
+      # never from the profile endpoint.
+      def email
+        id_token_claims['email']
+      end
+
+      # The ID token's claims as LINE's verify endpoint returned them, or an
+      # empty hash when there is no ID token or it could not be verified.
+      def id_token_claims
+        @id_token_claims ||= id_token ? verified_claims : {}
       end
 
       # Require: Access token with PROFILE permission issued.
       def raw_info
-        @raw_info ||= begin
-          profile = JSON.parse(access_token.get('v2/profile').body)
-          profile['email'] = email
-          profile
-        end
+        @raw_info ||= JSON.parse(access_token.get('v2/profile').body)
       rescue ::OAuth2::TimeoutError, ::Errno::ETIMEDOUT
         # omniauth-oauth2's callback_phase only maps ::Timeout::Error and
         # ::Errno::ETIMEDOUT to fail!(:timeout); OAuth2::TimeoutError is a
@@ -88,16 +111,60 @@ module OmniAuth
         raise ::Timeout::Error
       end
 
+      # `callback_url` is the option name omniauth-line 0.1.0 used.
       def callback_url
-        options[:redirect_uri] || (full_host + script_name + callback_path)
+        options[:redirect_uri] || options[:callback_url] || (full_host + script_name + callback_path)
       end
 
       private
 
-      def verify_id_token(id_token)
-        uri = URI('https://api.line.me/oauth2/v2.1/verify')
+      def id_token
+        access_token['id_token']
+      end
+
+      # Set by LINE on the callback only when `bot_prompt` was requested.
+      def friendship_status_changed
+        value = request.params['friendship_status_changed']
+        value.nil? ? nil : value.to_s == 'true'
+      end
+
+      def openid_scope?(scope)
+        scope.to_s.split(/[\s,]+/).include?('openid')
+      end
+
+      # The profile comes from the access token and the claims from the ID
+      # token; both were issued by the same token response, so they name the
+      # same user unless something is badly wrong.
+      def ensure_id_token_is_for_this_user!
+        subject = id_token_claims['sub']
+        return if subject.nil? || subject == raw_info['userId']
+
+        raise CallbackError.new(:invalid_credentials, 'the ID token and the profile name different users')
+      end
+
+      def verified_claims
+        response = verify_id_token
+        payload = JSON.parse(response.body)
+        return payload if response.is_a?(Net::HTTPSuccess) && payload.is_a?(Hash)
+
+        description = payload['error_description'] || payload['error'] if payload.is_a?(Hash)
+        log :warn, "ID token verify failed (HTTP #{response.code}): #{description}"
+        {}
+      rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ETIMEDOUT => e
+        log :warn, "ID token verify timed out (#{e.class})"
+        {}
+      rescue JSON::ParserError
+        log :warn, 'ID token verify returned a non-JSON body'
+        {}
+      end
+
+      def verify_id_token
+        uri = URI(VERIFY_URL)
         request = Net::HTTP::Post.new(uri)
-        request.set_form_data(id_token: id_token, client_id: client.id)
+        form = { id_token: id_token, client_id: client.id }
+        nonce = take_nonce
+        form[:nonce] = nonce if nonce
+        request.set_form_data(form)
         timeouts = options.verify_options || {}
         Net::HTTP.start(uri.host, uri.port,
                         use_ssl: true,
@@ -105,6 +172,29 @@ module OmniAuth
                         read_timeout: timeouts[:read_timeout] || DEFAULT_VERIFY_TIMEOUTS[:read_timeout]) do |http|
           http.request(request)
         end
+      end
+
+      # Nonces are kept per `state`, so two sign-ins started in one browser
+      # session each verify against their own.
+      def remember_nonce(state, nonce)
+        nonces = stored_nonces
+        nonces.delete(state.to_s)
+        nonces[state.to_s] = nonce.to_s
+        session[NONCE_SESSION_KEY] = nonces.to_a.last(MAX_STORED_NONCES).to_h
+      end
+
+      # nil when this callback's session did not start the sign-in; the
+      # verify call then checks everything about the token except the nonce.
+      def take_nonce
+        nonces = stored_nonces
+        nonce = nonces.delete(request.params['state'].to_s)
+        session[NONCE_SESSION_KEY] = nonces if nonce
+        nonce
+      end
+
+      def stored_nonces
+        nonces = session[NONCE_SESSION_KEY]
+        nonces.is_a?(Hash) ? nonces.dup : {}
       end
     end
   end
