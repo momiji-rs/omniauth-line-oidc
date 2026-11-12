@@ -23,6 +23,8 @@ Gem::Specification.new do |spec|
   spec.files = Dir['lib/**/*.rb', 'CHANGELOG.md', 'LICENSE.txt', 'README.md']
   spec.require_paths = ['lib']
 
-  spec.add_dependency 'omniauth', '~> 2.0'
-  spec.add_dependency 'omniauth-oauth2', '~> 1.8'
+  # omniauth-oauth2 1.10 is the first release that keeps state and the PKCE
+  # verifier per sign-in, so that two started in one session both complete.
+  spec.add_dependency 'omniauth', '~> 2.3', '>= 2.3.1'
+  spec.add_dependency 'omniauth-oauth2', '~> 1.10'
 end

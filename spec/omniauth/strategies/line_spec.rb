@@ -65,6 +65,62 @@ describe OmniAuth::Strategies::Line do
       allow(subject).to receive(:session).and_return({})
       expect(subject.authorize_params).not_to have_key(:channel_secret)
     end
+
+    context 'with a session' do
+      let(:session) { {} }
+      let(:redirect_uri) { 'https://app.test/auth/line/callback' }
+
+      # The strategy reads @options when it is built, so the options go in
+      # before the first use of subject.
+      def strategy_with(options)
+        @options = { redirect_uri: redirect_uri }.merge(options)
+        allow(subject).to receive(:session).and_return(session)
+        subject
+      end
+
+      it 'should generate a nonce and store it under the state' do
+        params = strategy_with({}).authorize_params
+
+        expect(params[:nonce]).to match(/\A[0-9a-f]{32}\z/)
+        expect(session['omniauth.line.nonces']).to eq(params[:state] => params[:nonce])
+      end
+
+      it 'should generate a different nonce for each request' do
+        strategy = strategy_with({})
+
+        expect(Array.new(3) { strategy.authorize_params[:nonce] }.uniq.size).to eq(3)
+      end
+
+      it 'should ignore a nonce set in the options, which would be the same for every sign-in' do
+        params = strategy_with(nonce: 'configured-once').authorize_params
+
+        expect(params[:nonce]).to match(/\A[0-9a-f]{32}\z/)
+        expect(session['omniauth.line.nonces']).to eq(params[:state] => params[:nonce])
+      end
+
+      it 'should send no nonce when the scope asks for no ID token' do
+        expect(strategy_with(scope: 'profile').authorize_params).not_to have_key(:nonce)
+        expect(session).not_to have_key('omniauth.line.nonces')
+      end
+
+      it 'should keep a nonce for each sign-in a session has under way, dropping the oldest' do
+        strategy = strategy_with({})
+        states = Array.new(6) { strategy.authorize_params[:state] }
+
+        expect(session['omniauth.line.nonces'].keys).to eq(states.last(5))
+      end
+
+      it 'should send a PKCE challenge by default' do
+        params = strategy_with({}).authorize_params
+
+        expect(params[:code_challenge_method]).to eq('S256')
+        expect(params[:code_challenge]).to match(/\A[A-Za-z0-9_-]{43}\z/)
+      end
+
+      it 'should send no PKCE challenge when it is turned off' do
+        expect(strategy_with(pkce: false).authorize_params).not_to have_key(:code_challenge)
+      end
+    end
   end
 
   describe 'callback_url' do
@@ -77,6 +133,16 @@ describe OmniAuth::Strategies::Line do
     it 'should prefer an explicitly configured redirect_uri' do
       @options = { redirect_uri: 'https://school.example.com/api/auth/line/callback' }
       expect(subject.callback_url).to eq('https://school.example.com/api/auth/line/callback')
+    end
+
+    it 'should accept callback_url, the option name omniauth-line used' do
+      @options = { callback_url: 'https://legacy.example.com/auth/line/callback' }
+      expect(subject.callback_url).to eq('https://legacy.example.com/auth/line/callback')
+    end
+
+    it 'should prefer redirect_uri when both are set' do
+      @options = { redirect_uri: 'https://new.example.com/cb', callback_url: 'https://legacy.example.com/cb' }
+      expect(subject.callback_url).to eq('https://new.example.com/cb')
     end
   end
 
@@ -104,8 +170,11 @@ describe OmniAuth::Strategies::Line do
       }
     end
 
+    let(:session) { {} }
+
     before do
       allow(subject).to receive(:access_token).and_return(access_token)
+      allow(subject).to receive(:session).and_return(session)
 
       stub_request(:get, 'https://api.line.me/v2/profile')
         .with(:headers => { 'Authorization' => 'Bearer access-token' })
@@ -146,6 +215,83 @@ describe OmniAuth::Strategies::Line do
       it 'should contain the id token' do
         expect(subject.extra[:id_token]).to eq(id_token)
       end
+
+      it 'should contain the verified id token claims' do
+        expect(subject.extra[:id_token_claims]).to eq(verify_response)
+      end
+
+      it 'should contain the profile' do
+        expect(subject.extra[:raw_info]).to eq(profile_response)
+      end
+
+      it 'should verify the id token once however many claims are read' do
+        subject.info
+        subject.extra
+        subject.uid
+        expect(a_request(:post, 'https://api.line.me/oauth2/v2.1/verify')).to have_been_made.once
+      end
+
+      it 'should leave out the claims when the verify endpoint is unavailable' do
+        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
+          .to_return(:status => 503, :body => { 'message' => 'unavailable' }.to_json)
+        expect(subject.extra).to eq(raw_info: profile_response, id_token: id_token)
+      end
+    end
+
+    describe 'friendship status' do
+      it 'should be absent when LINE did not report it' do
+        expect(subject.extra).not_to have_key(:friendship_status_changed)
+      end
+
+      it 'should be true when the user added the official account during sign-in' do
+        allow(request).to receive(:params).and_return('friendship_status_changed' => 'true')
+        expect(subject.extra[:friendship_status_changed]).to be(true)
+      end
+
+      it 'should be false when the friendship did not change' do
+        allow(request).to receive(:params).and_return('friendship_status_changed' => 'false')
+        expect(subject.extra[:friendship_status_changed]).to be(false)
+      end
+    end
+
+    describe 'an id token LINE rejects' do
+      before do
+        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
+          .to_return(:status => 400,
+                     :body => { 'error' => 'invalid_request', 'error_description' => 'Invalid IdToken Nonce.' }.to_json)
+      end
+
+      it 'should fail the sign-in, saying what LINE said' do
+        expect { subject.uid }
+          .to raise_error(OmniAuth::Strategies::OAuth2::CallbackError, /LINE rejected the ID token: Invalid IdToken Nonce\./)
+      end
+
+      it 'should fail the sign-in whichever part of the auth hash is read first' do
+        expect { subject.info }.to raise_error(OmniAuth::Strategies::OAuth2::CallbackError)
+        expect { subject.extra }.to raise_error(OmniAuth::Strategies::OAuth2::CallbackError)
+      end
+
+      it 'should fail the sign-in when the rejection has no readable body' do
+        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify').to_return(:status => 400, :body => 'nope')
+        expect { subject.uid }.to raise_error(OmniAuth::Strategies::OAuth2::CallbackError, /LINE rejected the ID token/)
+      end
+    end
+
+    describe 'the id token subject' do
+      it 'should fail the sign-in when it names a different user than the profile' do
+        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
+          .to_return(:status => 200, :body => verify_response.merge('sub' => 'Usomeoneelse').to_json)
+
+        expect { subject.uid }.to raise_error(OmniAuth::Strategies::OAuth2::CallbackError, /different users/)
+      end
+
+      it 'should use no claim from a verify response that names no subject' do
+        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
+          .to_return(:status => 200, :body => { 'email' => 'victim@example.com' }.to_json)
+
+        expect(subject.info[:email]).to be_nil
+        expect(subject.extra).not_to have_key(:id_token_claims)
+      end
     end
 
     describe 'raw_info' do
@@ -154,44 +300,64 @@ describe OmniAuth::Strategies::Line do
         expect(a_request(:get, 'https://api.line.me/v2/profile')).to have_been_made.once
       end
 
-      it 'should convert profile connection timeouts into Timeout::Error' do
-        stub_request(:get, 'https://api.line.me/v2/profile').to_raise(Errno::ETIMEDOUT)
-        expect { subject.raw_info }.to raise_error(Timeout::Error)
+      ['<html>Bad Gateway</html>', '[]', 'null', '{"displayName":"Foo Bar"}'].each do |body|
+        it "should fail the sign-in when the profile response is #{body}" do
+          stub_request(:get, 'https://api.line.me/v2/profile').to_return(:status => 200, :body => body)
+          expect { subject.raw_info }
+            .to raise_error(OmniAuth::Strategies::OAuth2::CallbackError, /names no user/)
+        end
       end
     end
 
-    describe 'email degradation' do
-      it 'should return no email when the verify call times out' do
-        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify').to_timeout
-        expect(subject.info[:email]).to be_nil
+    describe 'when LINE cannot be asked about the id token' do
+      [
+        Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, Errno::ETIMEDOUT, Errno::ECONNRESET,
+        Errno::ECONNREFUSED, Errno::EHOSTUNREACH, SocketError, EOFError, OpenSSL::SSL::SSLError
+      ].each do |error|
+        it "should sign in without the claims on #{error}" do
+          stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify').to_raise(error)
+
+          expect(subject.uid).to eq('U4af4980629abc')
+          expect(subject.info[:email]).to be_nil
+          expect(subject.extra).not_to have_key(:id_token_claims)
+        end
       end
 
-      it 'should return no email when the verify call is rejected' do
-        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
-          .to_return(:status => 400,
-                     :body => { 'error' => 'invalid_request', 'error_description' => 'Invalid IdToken.' }.to_json,
-                     :headers => { 'Content-Type' => 'application/json' })
-        expect(subject.info[:email]).to be_nil
-      end
-
-      it 'should return no email when the verify response is not JSON' do
+      it 'should return no email when the verify response is a server error' do
         stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
           .to_return(:status => 502, :body => '<html>Bad Gateway</html>')
         expect(subject.info[:email]).to be_nil
       end
 
-      it 'should fall back to default timeouts when verify_options is overridden away' do
-        @options = { verify_options: nil }
+      it 'should log a warning' do
+        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify').to_return(:status => 503, :body => '')
+        expect(subject).to receive(:log).with(:warn, /unavailable \(HTTP 503\)/)
+        subject.info
+      end
+    end
+
+    describe 'verify timeouts' do
+      def expect_verify_timeouts(open:, read:)
+        expect(Net::HTTP).to receive(:start)
+          .with('api.line.me', 443, hash_including(:use_ssl => true, :open_timeout => open, :read_timeout => read))
+          .and_call_original
         expect(subject.info[:email]).to eq('foo@example.com')
       end
 
-      it 'should log a warning on verify failure' do
-        stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
-          .to_return(:status => 400,
-                     :body => { 'error' => 'invalid_request', 'error_description' => 'Invalid IdToken.' }.to_json,
-                     :headers => { 'Content-Type' => 'application/json' })
-        expect(subject).to receive(:log).with(:warn, /Invalid IdToken/)
-        subject.info
+      it 'should default to 5 seconds to open and 10 to read' do
+        expect_verify_timeouts(open: 5, read: 10)
+      end
+
+      # The strategy already exists by now (the before block built it), so
+      # the option is set on it rather than through @options.
+      it 'should use the configured timeouts' do
+        subject.options[:verify_options] = { open_timeout: 1, read_timeout: 2 }
+        expect_verify_timeouts(open: 1, read: 2)
+      end
+
+      it 'should fall back to the defaults when verify_options is overridden away' do
+        subject.options[:verify_options] = nil
+        expect_verify_timeouts(open: 5, read: 10)
       end
     end
 
@@ -209,8 +375,8 @@ describe OmniAuth::Strategies::Line do
         expect(a_request(:post, 'https://api.line.me/oauth2/v2.1/verify')).not_to have_been_made
       end
 
-      it 'should omit the id token from extra' do
-        expect(subject.extra).to eq({})
+      it 'should carry only the profile in extra' do
+        expect(subject.extra).to eq(raw_info: profile_response)
       end
     end
 
@@ -238,11 +404,13 @@ describe OmniAuth::Strategies::Line do
 
     before do
       allow(subject).to receive(:access_token).and_return(access_token)
+      allow(subject).to receive(:session).and_return({})
     end
 
-    it 'should degrade to a nil email when LINE rejects the id token' do
+    it 'should fail the sign-in when LINE rejects the id token' do
       VCR.use_cassette('verify_invalid_id_token') do
-        expect(subject.email).to be_nil
+        expect { subject.email }
+          .to raise_error(OmniAuth::Strategies::OAuth2::CallbackError, /LINE rejected the ID token/)
       end
     end
 
