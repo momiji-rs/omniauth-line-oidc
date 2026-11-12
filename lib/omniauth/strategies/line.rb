@@ -19,10 +19,10 @@ module OmniAuth
     # claims.
     class Line < OmniAuth::Strategies::OAuth2
       VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify'
-      NONCE_SESSION_KEY = 'omniauth.line.nonces'
+      SESSION_KEY = 'omniauth.line'
       # Sign-ins a browser session can have under way at once, each with its
       # own nonce; the oldest is dropped beyond this.
-      MAX_STORED_NONCES = 5
+      MAX_PENDING_SIGN_INS = 5
 
       # Failures that say nothing about the token: LINE was not reached, or
       # did not answer.
@@ -33,10 +33,11 @@ module OmniAuth
       option :name, 'line'
       option :scope, 'profile openid'
 
-      # LINE supports PKCE with S256 only, which is what omniauth-oauth2 sends.
-      # Set `pkce: false` when the callback is handled without the session
-      # that started the sign-in, since the verifier lives in that session.
-      option :pkce, true
+      # LINE supports PKCE with S256 only, which is what omniauth-oauth2 sends
+      # with `pkce: true`. It is off unless asked for because omniauth-oauth2
+      # keeps a 128-character verifier in the session for each of the last
+      # five sign-ins, which a 4 KB cookie session has no room for.
+      option :pkce, false
 
       # omniauth-oauth2 only forwards options named here to the authorize
       # URL; anything else set on the strategy is silently dropped. `nonce` is
@@ -91,8 +92,7 @@ module OmniAuth
         super.tap do |params|
           next unless openid_scope?(params[:scope])
 
-          params[:nonce] = SecureRandom.hex(16)
-          remember_nonce(params[:state], params[:nonce])
+          params[:nonce] = issue_nonce(params[:state].to_s)
         end
       end
 
@@ -200,27 +200,50 @@ module OmniAuth
         nil
       end
 
-      # Nonces are kept per `state`, so two sign-ins started in one browser
-      # session each verify against their own.
-      def remember_nonce(state, nonce)
-        nonces = stored_nonces
-        nonces.delete(state.to_s)
-        nonces[state.to_s] = nonce.to_s
-        session[NONCE_SESSION_KEY] = nonces.to_a.last(MAX_STORED_NONCES).to_h
+      # The session is often a 4 KB cookie, so it holds one secret and a short
+      # fingerprint of each sign-in under way rather than a nonce per sign-in.
+      # A sign-in's nonce is derived from the secret and its `state`, which
+      # gives two sign-ins started in one browser session each their own.
+      def issue_nonce(state)
+        secret = stored_secret || SecureRandom.hex(16)
+        pending = (stored_pending - [fingerprint(secret, state)]) << fingerprint(secret, state)
+        session[SESSION_KEY] = { 'secret' => secret, 'pending' => pending.last(MAX_PENDING_SIGN_INS) }
+        nonce_for(secret, state)
       end
 
       # nil when this callback's session did not start the sign-in; the
       # verify call then checks everything about the token except the nonce.
       def take_nonce
-        nonces = stored_nonces
-        nonce = nonces.delete(request.params['state'].to_s)
-        session[NONCE_SESSION_KEY] = nonces if nonce
-        nonce
+        secret = stored_secret
+        state = request.params['state'].to_s
+        pending = stored_pending
+        return unless secret && pending.delete(fingerprint(secret, state))
+
+        session[SESSION_KEY] = { 'secret' => secret, 'pending' => pending }
+        nonce_for(secret, state)
       end
 
-      def stored_nonces
-        nonces = session[NONCE_SESSION_KEY]
-        nonces.is_a?(Hash) ? nonces.dup : {}
+      def nonce_for(secret, state)
+        OpenSSL::HMAC.hexdigest('SHA256', secret, "nonce:#{state}")[0, 32]
+      end
+
+      def fingerprint(secret, state)
+        OpenSSL::HMAC.hexdigest('SHA256', secret, "state:#{state}")[0, 8]
+      end
+
+      def stored_secret
+        secret = stored['secret']
+        secret if secret.is_a?(String) && !secret.empty?
+      end
+
+      def stored_pending
+        pending = stored['pending']
+        pending.is_a?(Array) ? pending.dup : []
+      end
+
+      def stored
+        value = session[SESSION_KEY]
+        value.is_a?(Hash) ? value : {}
       end
     end
   end

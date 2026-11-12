@@ -78,11 +78,18 @@ describe OmniAuth::Strategies::Line do
         subject
       end
 
-      it 'should generate a nonce and store it under the state' do
+      it 'should generate a nonce and note the sign-in in the session' do
         params = strategy_with({}).authorize_params
 
         expect(params[:nonce]).to match(/\A[0-9a-f]{32}\z/)
-        expect(session['omniauth.line.nonces']).to eq(params[:state] => params[:nonce])
+        expect(session['omniauth.line']).to match('secret' => /\A[0-9a-f]{32}\z/, 'pending' => [/\A[0-9a-f]{8}\z/])
+      end
+
+      it 'should take the same small part of the session however many sign-ins are under way' do
+        strategy = strategy_with({})
+        6.times { strategy.authorize_params }
+
+        expect(JSON.generate(session['omniauth.line']).bytesize).to be < 130
       end
 
       it 'should generate a different nonce for each request' do
@@ -95,30 +102,46 @@ describe OmniAuth::Strategies::Line do
         params = strategy_with(nonce: 'configured-once').authorize_params
 
         expect(params[:nonce]).to match(/\A[0-9a-f]{32}\z/)
-        expect(session['omniauth.line.nonces']).to eq(params[:state] => params[:nonce])
+        expect(session['omniauth.line']['pending'].size).to eq(1)
       end
 
       it 'should send no nonce when the scope asks for no ID token' do
         expect(strategy_with(scope: 'profile').authorize_params).not_to have_key(:nonce)
-        expect(session).not_to have_key('omniauth.line.nonces')
+        expect(session).not_to have_key('omniauth.line')
       end
 
-      it 'should keep a nonce for each sign-in a session has under way, dropping the oldest' do
+      it 'should note at most five sign-ins under way' do
         strategy = strategy_with({})
-        states = Array.new(6) { strategy.authorize_params[:state] }
+        6.times { strategy.authorize_params }
 
-        expect(session['omniauth.line.nonces'].keys).to eq(states.last(5))
+        expect(session['omniauth.line']['pending'].size).to eq(5)
       end
 
-      it 'should send a PKCE challenge by default' do
-        params = strategy_with({}).authorize_params
+      it 'should keep one secret for the session across sign-ins' do
+        strategy = strategy_with({})
+        secrets = Array.new(3) { strategy.authorize_params && session['omniauth.line']['secret'] }
+
+        expect(secrets.uniq.size).to eq(1)
+      end
+
+      it 'should give each session a secret of its own' do
+        strategy = strategy_with({})
+        strategy.authorize_params
+        first = session.delete('omniauth.line')['secret']
+        strategy.authorize_params
+
+        expect(session['omniauth.line']['secret']).not_to eq(first)
+      end
+
+      it 'should send no PKCE challenge unless asked' do
+        expect(strategy_with({}).authorize_params).not_to have_key(:code_challenge)
+      end
+
+      it 'should send a PKCE challenge when it is turned on' do
+        params = strategy_with(pkce: true).authorize_params
 
         expect(params[:code_challenge_method]).to eq('S256')
         expect(params[:code_challenge]).to match(/\A[A-Za-z0-9_-]{43}\z/)
-      end
-
-      it 'should send no PKCE challenge when it is turned off' do
-        expect(strategy_with(pkce: false).authorize_params).not_to have_key(:code_challenge)
       end
     end
   end

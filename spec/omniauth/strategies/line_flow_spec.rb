@@ -19,7 +19,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
       use OmniAuth::Strategies::Line, 'channel-id', 'channel-secret', options
       run lambda { |env|
         seen_by_app[:auth] = env['omniauth.auth']
-        seen_by_app[:nonces] = env['rack.session']['omniauth.line.nonces']
+        seen_by_app[:pending] = env['rack.session']['omniauth.line']&.fetch('pending')
         [200, {}, ['signed in']]
       }
     end.to_app
@@ -32,7 +32,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     failures = seen
     OmniAuth.config.on_failure = lambda { |env|
       failures[:failure] = env['omniauth.error.type']
-      failures[:nonces] = env['rack.session']['omniauth.line.nonces']
+      failures[:pending] = env['rack.session']['omniauth.line']&.fetch('pending')
       [401, {}, ['refused']]
     }
     example.run
@@ -70,17 +70,37 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
       .to_return(status: status, body: (body || claims).to_json)
   end
 
-  it 'sends the browser to LINE with a state, a nonce and a PKCE challenge' do
+  it 'sends the browser to LINE with a state and a nonce' do
     endpoint, params = start_sign_in
 
     expect(endpoint).to eq('https://access.line.me/oauth2/v2.1/authorize')
-    expect(params).to include('response_type' => 'code', 'client_id' => 'channel-id', 'scope' => 'profile openid',
-                              'code_challenge_method' => 'S256')
+    expect(params).to include('response_type' => 'code', 'client_id' => 'channel-id', 'scope' => 'profile openid')
     expect(params['redirect_uri']).to end_with('/auth/line/callback')
-    expect(params.values_at('state', 'nonce', 'code_challenge')).to all(be_a(String).and(satisfy { |v| !v.empty? }))
+    expect(params.values_at('state', 'nonce')).to all(be_a(String).and(satisfy { |v| !v.empty? }))
+    expect(params).not_to have_key('code_challenge')
   end
 
-  it 'signs the user in, proving the code with the PKCE verifier and the ID token with the nonce' do
+  context 'with PKCE turned on' do
+    let(:strategy_options) { { pkce: true } }
+
+    it 'proves the code with the verifier behind the challenge it sent' do
+      _, params = start_sign_in
+      token = stub_token
+      stub_profile
+      stub_verify(nonce: params['nonce'])
+
+      get '/auth/line/callback', code: 'one-time-code', state: params['state']
+
+      expect(last_response.status).to eq(200)
+      expect(params['code_challenge_method']).to eq('S256')
+      expect(token.with { |request|
+        verifier = Rack::Utils.parse_query(request.body)['code_verifier'].to_s
+        Base64.urlsafe_encode64(Digest::SHA256.digest(verifier), padding: false) == params['code_challenge']
+      }).to have_been_requested.once
+    end
+  end
+
+  it 'signs the user in, proving the ID token with the nonce' do
     _, params = start_sign_in
     token = stub_token
     stub_profile
@@ -91,10 +111,9 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     expect(last_response.status).to eq(200)
     expect(token.with { |request|
       form = Rack::Utils.parse_query(request.body)
-      challenge = Base64.urlsafe_encode64(Digest::SHA256.digest(form['code_verifier'].to_s), padding: false)
       form.values_at('grant_type', 'code', 'client_id', 'client_secret') ==
         %w[authorization_code one-time-code channel-id channel-secret] &&
-        form['redirect_uri'] == params['redirect_uri'] && challenge == params['code_challenge'] &&
+        form['redirect_uri'] == params['redirect_uri'] && !form.key?('code_verifier') &&
         !request.headers.key?('Authorization')
     }).to have_been_requested.once
     expect(verify).to have_been_requested.once
@@ -184,13 +203,13 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
       get '/auth/line/callback', code: 'one-time-code', state: first['state']
 
       expect(first_verify).to have_been_requested.once
-      expect(seen[:nonces]).to eq(second['state'] => second['nonce'])
+      expect(seen[:pending].size).to eq(1)
 
       second_verify = stub_verify(nonce: second['nonce'])
       get '/auth/line/callback', code: 'another-code', state: second['state']
 
       expect(second_verify).to have_been_requested.once
-      expect(seen[:nonces]).to eq({})
+      expect(seen[:pending]).to eq([])
     end
 
     it 'is dropped when LINE sends the user back with an error' do
@@ -199,7 +218,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
       get '/auth/line/callback', error: 'access_denied', state: params['state']
 
       expect(seen[:failure]).to eq(:access_denied)
-      expect(seen[:nonces]).to eq({})
+      expect(seen[:pending]).to eq([])
     end
 
     it 'is dropped when the token response carries no ID token' do
@@ -210,7 +229,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
       get '/auth/line/callback', code: 'one-time-code', state: params['state']
 
       expect(last_response.status).to eq(200)
-      expect(seen[:nonces]).to eq({})
+      expect(seen[:pending]).to eq([])
       expect(a_request(:post, 'https://api.line.me/oauth2/v2.1/verify')).not_to have_been_made
     end
 
@@ -219,7 +238,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
 
       get '/auth/line/callback', code: 'one-time-code', state: 'forged'
 
-      expect(seen[:nonces]).to eq(params['state'] => params['nonce'])
+      expect(seen[:pending].size).to eq(1)
     end
   end
 
@@ -235,7 +254,22 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
   end
 
   context 'when the callback is handled without the session that started the sign-in' do
-    let(:strategy_options) { { pkce: false, provider_ignores_state: true } }
+    let(:strategy_options) { { provider_ignores_state: true } }
+
+    it 'sends no nonce for a state this session did not issue, though it has a sign-in of its own under way' do
+      start_sign_in
+      stub_token
+      stub_profile
+      verify = stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify')
+               .with(body: { 'id_token' => id_token, 'client_id' => 'channel-id' })
+               .to_return(status: 200, body: { sub: 'U4af4980629abc' }.to_json)
+
+      get '/auth/line/callback', code: 'one-time-code', state: 'from-another-session'
+
+      expect(last_response.status).to eq(200)
+      expect(verify).to have_been_requested.once
+      expect(seen[:pending].size).to eq(1)
+    end
 
     it 'signs the user in, verifying the ID token without a nonce' do
       stub_token
