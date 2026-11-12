@@ -1,7 +1,9 @@
 .env
 /.bundle/
 /Gemfile.lock
+/gemfiles/*.lock
+/gemfiles/vendor/
 /coverage/
 /pkg/
-/vendor/bundle/
+/vendor/
 *.gem

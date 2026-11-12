@@ -1,0 +1,45 @@
+name: Release
+
+# Pushing a tag `v<version>` publishes that version to RubyGems.org through
+# trusted publishing: RubyGems accepts the push because it comes from this
+# workflow file in this repository, so no API key is stored anywhere.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history, for the ancestry check below.
+          fetch-depth: 0
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      # `rake release` pushes nothing to git only when the tag for the
+      # gemspec's version already exists, so the two must agree.
+      - name: Check the tag matches the gem version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(ruby -r ./lib/omniauth/line_oidc/version -e 'print OmniAuth::LineOidc::VERSION')"
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::tag ${TAG} does not match the gem version ${version}"
+            exit 1
+          fi
+      - name: Check the tagged commit is on master
+        run: |
+          git fetch --no-tags origin master
+          git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD
+      - run: bundle exec rake spec
+      - uses: rubygems/release-gem@7f9650160c1a4e7989fdc9855807bdbd421d8b6b # v1.4.1
