@@ -21,16 +21,23 @@ gem 'omniauth-line-oidc'
 ### Switching from `omniauth-line`
 
 Replace the gem in your Gemfile; the provider name, the callback path
-(`/auth/line/callback`) and the auth hash keys are the same. Three things
-to check:
+(`/auth/line/callback`) and the auth hash keys are the same. Things to
+check:
 
 - PKCE is on by default. It needs nothing from you unless your callback is
   handled without the session that started the sign-in; see
   [Callbacks handled by another session](#callbacks-handled-by-another-session).
+- A sign-in started before the deploy and finished after it has no PKCE
+  verifier or nonce in its session, and may be refused by LINE; the user
+  signs in again.
+- A sign-in now fails when LINE rejects the ID token. `omniauth-line`
+  ignored the rejection and returned no email.
 - `extra` now also carries `raw_info`, and `id_token_claims` when the ID
   token was verified.
 - Do not keep both gems in one bundle: both define
-  `OmniAuth::Strategies::Line`.
+  `OmniAuth::Strategies::Line`. If you require the gem by name, the file
+  is `omniauth-line-oidc`.
+- Requires `omniauth-oauth2` 1.10 or newer.
 
 See the [changelog](CHANGELOG.md) for everything that differs from
 `omniauth-line` 0.1.0.
@@ -69,7 +76,8 @@ profile API. When the `email` scope is not granted, `info[:email]` is
 Besides the standard OmniAuth options, the strategy forwards these to
 LINE's authorization URL when you set them: `prompt`, `max_age`,
 `ui_locales`, `bot_prompt`, `initial_amr_display`, `switch_amr`,
-`disable_auto_login`, `disable_ios_auto_login`, `nonce`.
+`disable_auto_login`, `disable_ios_auto_login`. There is no `nonce`
+option: the strategy generates a fresh one for every sign-in.
 
 ```ruby
 provider :line, ENV['LINE_CHANNEL_ID'], ENV['LINE_CHANNEL_SECRET'],
@@ -98,16 +106,25 @@ API does not have, the email above all.
 - On the callback it sends the ID token, the channel ID and that nonce
   to LINE's [verify endpoint](https://developers.line.biz/en/reference/line-login/#verify-id-token).
   LINE checks the signature, issuer, audience, expiry and nonce.
-- Claims are used only from a token LINE accepted. If the verify call is
-  rejected or times out, the sign-in continues without them:
-  `info[:email]` is `nil` and `extra[:id_token_claims]` is absent. A
-  warning is logged.
+- If LINE rejects the token (HTTP 400, which is also its answer to a
+  wrong nonce), the sign-in fails with `invalid_credentials`.
 - If the verified token names a different user than the profile, the
   sign-in fails with `invalid_credentials`.
+- If LINE cannot be asked (the call times out, the connection fails, or
+  LINE answers with a server error), the sign-in continues without the
+  claims: `info[:email]` is `nil` and `extra[:id_token_claims]` is
+  absent. A warning is logged. Handle a `nil` email as you already must
+  for a user who declines the `email` scope.
 
 The raw `extra[:id_token]` is passed through as LINE issued it. Do not
 read claims out of it yourself; use `extra[:id_token_claims]`, which is
 only present after verification.
+
+The strategy keeps one nonce for each sign-in a browser session has
+under way, up to five, next to what `omniauth-oauth2` stores for state
+and PKCE. Five unfinished sign-ins come to about 2.5 KB of session data,
+which matters if your sessions live in a 4 KB cookie that is already
+well filled.
 
 ### Callbacks handled by another session
 

@@ -19,6 +19,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
       use OmniAuth::Strategies::Line, 'channel-id', 'channel-secret', options
       run lambda { |env|
         seen_by_app[:auth] = env['omniauth.auth']
+        seen_by_app[:nonces] = env['rack.session']['omniauth.line.nonces']
         [200, {}, ['signed in']]
       }
     end.to_app
@@ -31,6 +32,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     failures = seen
     OmniAuth.config.on_failure = lambda { |env|
       failures[:failure] = env['omniauth.error.type']
+      failures[:nonces] = env['rack.session']['omniauth.line.nonces']
       [401, {}, ['refused']]
     }
     example.run
@@ -108,12 +110,25 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     expect(auth.extra.id_token_claims.to_h).to include('amr' => ['linesso'], 'sub' => 'U4af4980629abc')
   end
 
-  it 'still signs the user in, without the ID token claims, when LINE rejects the nonce' do
+  it 'refuses the sign-in when LINE rejects the ID token for its nonce' do
     _, params = start_sign_in
     stub_token
     stub_profile
     stub_verify(nonce: params['nonce'], status: 400,
                 body: { error: 'invalid_request', error_description: 'Invalid IdToken Nonce.' })
+
+    get '/auth/line/callback', code: 'one-time-code', state: params['state']
+
+    expect(last_response.status).to eq(401)
+    expect(seen[:failure]).to eq(:invalid_credentials)
+    expect(seen).not_to have_key(:auth)
+  end
+
+  it 'signs the user in without the ID token claims when the verify endpoint cannot be reached' do
+    _, params = start_sign_in
+    stub_token
+    stub_profile
+    stub_request(:post, 'https://api.line.me/oauth2/v2.1/verify').to_raise(Errno::ECONNRESET)
 
     get '/auth/line/callback', code: 'one-time-code', state: params['state']
 
@@ -123,6 +138,18 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     expect(seen[:auth].extra.to_h).not_to have_key('id_token_claims')
   end
 
+  it 'reports a timeout when the profile API does not answer' do
+    _, params = start_sign_in
+    stub_token
+    stub_request(:get, 'https://api.line.me/v2/profile').to_timeout
+    stub_verify(nonce: params['nonce'])
+
+    get '/auth/line/callback', code: 'one-time-code', state: params['state']
+
+    expect(last_response.status).to eq(401)
+    expect(seen[:failure]).to eq(:timeout)
+  end
+
   it 'refuses a callback whose state the session did not issue' do
     start_sign_in
     token = stub_token
@@ -130,7 +157,7 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     get '/auth/line/callback', code: 'one-time-code', state: 'forged'
 
     expect(last_response.status).to eq(401)
-    expect(seen).to eq(failure: :csrf_detected)
+    expect(seen[:failure]).to eq(:csrf_detected)
     expect(token).not_to have_been_requested
   end
 
@@ -143,7 +170,57 @@ describe OmniAuth::Strategies::Line, 'sign-in flow' do
     get '/auth/line/callback', code: 'one-time-code', state: params['state']
 
     expect(last_response.status).to eq(401)
-    expect(seen).to eq(failure: :invalid_credentials)
+    expect(seen[:failure]).to eq(:invalid_credentials)
+  end
+
+  describe 'the stored nonce' do
+    it 'is used once, and a sign-in started alongside keeps its own' do
+      _, first = start_sign_in
+      _, second = start_sign_in
+      stub_token
+      stub_profile
+      first_verify = stub_verify(nonce: first['nonce'])
+
+      get '/auth/line/callback', code: 'one-time-code', state: first['state']
+
+      expect(first_verify).to have_been_requested.once
+      expect(seen[:nonces]).to eq(second['state'] => second['nonce'])
+
+      second_verify = stub_verify(nonce: second['nonce'])
+      get '/auth/line/callback', code: 'another-code', state: second['state']
+
+      expect(second_verify).to have_been_requested.once
+      expect(seen[:nonces]).to eq({})
+    end
+
+    it 'is dropped when LINE sends the user back with an error' do
+      _, params = start_sign_in
+
+      get '/auth/line/callback', error: 'access_denied', state: params['state']
+
+      expect(seen[:failure]).to eq(:access_denied)
+      expect(seen[:nonces]).to eq({})
+    end
+
+    it 'is dropped when the token response carries no ID token' do
+      _, params = start_sign_in
+      stub_token(id_token: nil)
+      stub_profile
+
+      get '/auth/line/callback', code: 'one-time-code', state: params['state']
+
+      expect(last_response.status).to eq(200)
+      expect(seen[:nonces]).to eq({})
+      expect(a_request(:post, 'https://api.line.me/oauth2/v2.1/verify')).not_to have_been_made
+    end
+
+    it 'is left alone by a callback with a forged state' do
+      _, params = start_sign_in
+
+      get '/auth/line/callback', code: 'one-time-code', state: 'forged'
+
+      expect(seen[:nonces]).to eq(params['state'] => params['nonce'])
+    end
   end
 
   it 'reports that the user added the official account when bot_prompt asked for it' do

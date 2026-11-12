@@ -3,6 +3,7 @@
 require 'omniauth-oauth2'
 require 'json'
 require 'net/http'
+require 'openssl'
 require 'securerandom'
 
 module OmniAuth
@@ -13,14 +14,21 @@ module OmniAuth
     # this sign-in was just issued. The ID token adds claims the profile API
     # does not have (the email above all). Its claims are used only after
     # LINE's verify endpoint has accepted the token, together with the nonce
-    # this strategy sent; a token that cannot be verified contributes nothing
-    # and the sign-in carries on without those claims.
+    # this strategy sent. A token LINE rejects fails the sign-in; a verify
+    # endpoint that cannot be reached leaves the sign-in working without the
+    # claims.
     class Line < OmniAuth::Strategies::OAuth2
       VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify'
       NONCE_SESSION_KEY = 'omniauth.line.nonces'
       # Sign-ins a browser session can have under way at once, each with its
       # own nonce; the oldest is dropped beyond this.
       MAX_STORED_NONCES = 5
+
+      # Failures that say nothing about the token: LINE was not reached, or
+      # did not answer.
+      VERIFY_UNREACHABLE = [
+        ::Timeout::Error, ::SystemCallError, ::SocketError, ::IOError, ::OpenSSL::SSL::SSLError
+      ].freeze
 
       option :name, 'line'
       option :scope, 'profile openid'
@@ -31,9 +39,11 @@ module OmniAuth
       option :pkce, true
 
       # omniauth-oauth2 only forwards options named here to the authorize
-      # URL; anything else set on the strategy is silently dropped.
+      # URL; anything else set on the strategy is silently dropped. `nonce` is
+      # absent on purpose: a nonce configured once would be the same for every
+      # sign-in, so the strategy always generates its own.
       option :authorize_options, %i[
-        scope state prompt nonce max_age ui_locales bot_prompt
+        scope state prompt max_age ui_locales bot_prompt
         initial_amr_display switch_amr disable_auto_login
         disable_ios_auto_login
       ]
@@ -45,9 +55,6 @@ module OmniAuth
 
       # Authorization lives on access.line.me while every API call
       # (token exchange, profile, verify) lives on api.line.me.
-      # LINE documents only client_secret_post for the token endpoint; the
-      # oauth2 gem's basic-auth default happens to work but is undocumented
-      # LINE behavior.
       option :client_options, {
         site: 'https://api.line.me',
         authorize_url: 'https://access.line.me/oauth2/v2.1/authorize',
@@ -84,9 +91,16 @@ module OmniAuth
         super.tap do |params|
           next unless openid_scope?(params[:scope])
 
-          params[:nonce] ||= SecureRandom.hex(16)
+          params[:nonce] = SecureRandom.hex(16)
           remember_nonce(params[:state], params[:nonce])
         end
+      end
+
+      # The nonce is taken before anything can fail, so a callback that is
+      # refused or carries an error leaves none behind.
+      def callback_phase
+        @nonce = take_nonce
+        super
       end
 
       # LINE returns the email claim only inside the ID token (email scope),
@@ -96,19 +110,14 @@ module OmniAuth
       end
 
       # The ID token's claims as LINE's verify endpoint returned them, or an
-      # empty hash when there is no ID token or it could not be verified.
+      # empty hash when there is no ID token or LINE could not be asked.
       def id_token_claims
         @id_token_claims ||= id_token ? verified_claims : {}
       end
 
       # Require: Access token with PROFILE permission issued.
       def raw_info
-        @raw_info ||= JSON.parse(access_token.get('v2/profile').body)
-      rescue ::OAuth2::TimeoutError, ::Errno::ETIMEDOUT
-        # omniauth-oauth2's callback_phase only maps ::Timeout::Error and
-        # ::Errno::ETIMEDOUT to fail!(:timeout); OAuth2::TimeoutError is a
-        # Faraday subclass it would let escape as a 500.
-        raise ::Timeout::Error
+        @raw_info ||= fetch_profile
       end
 
       # `callback_url` is the option name omniauth-line 0.1.0 used.
@@ -132,6 +141,13 @@ module OmniAuth
         scope.to_s.split(/[\s,]+/).include?('openid')
       end
 
+      def fetch_profile
+        profile = parse_json(access_token.get('v2/profile').body)
+        return profile if profile.is_a?(Hash) && profile['userId']
+
+        raise CallbackError.new(:invalid_credentials, 'the profile response names no user')
+      end
+
       # The profile comes from the access token and the claims from the ID
       # token; both were issued by the same token response, so they name the
       # same user unless something is badly wrong.
@@ -144,17 +160,22 @@ module OmniAuth
 
       def verified_claims
         response = verify_id_token
-        payload = JSON.parse(response.body)
-        return payload if response.is_a?(Net::HTTPSuccess) && payload.is_a?(Hash)
+        payload = parse_json(response.body)
 
-        description = payload['error_description'] || payload['error'] if payload.is_a?(Hash)
-        log :warn, "ID token verify failed (HTTP #{response.code}): #{description}"
+        if response.is_a?(Net::HTTPSuccess)
+          return payload if payload.is_a?(Hash) && payload['sub']
+
+          log :warn, 'ID token verify returned no claims'
+        elsif response.is_a?(Net::HTTPBadRequest)
+          # LINE's answer for a token that fails a check, the nonce included.
+          description = payload['error_description'] || payload['error'] if payload.is_a?(Hash)
+          raise CallbackError.new(:invalid_credentials, "LINE rejected the ID token: #{description}")
+        else
+          log :warn, "ID token verify unavailable (HTTP #{response.code})"
+        end
         {}
-      rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ETIMEDOUT => e
-        log :warn, "ID token verify timed out (#{e.class})"
-        {}
-      rescue JSON::ParserError
-        log :warn, 'ID token verify returned a non-JSON body'
+      rescue *VERIFY_UNREACHABLE => e
+        log :warn, "ID token verify could not be reached (#{e.class})"
         {}
       end
 
@@ -162,8 +183,7 @@ module OmniAuth
         uri = URI(VERIFY_URL)
         request = Net::HTTP::Post.new(uri)
         form = { id_token: id_token, client_id: client.id }
-        nonce = take_nonce
-        form[:nonce] = nonce if nonce
+        form[:nonce] = @nonce if @nonce
         request.set_form_data(form)
         timeouts = options.verify_options || {}
         Net::HTTP.start(uri.host, uri.port,
@@ -172,6 +192,12 @@ module OmniAuth
                         read_timeout: timeouts[:read_timeout] || DEFAULT_VERIFY_TIMEOUTS[:read_timeout]) do |http|
           http.request(request)
         end
+      end
+
+      def parse_json(body)
+        JSON.parse(body.to_s)
+      rescue JSON::ParserError
+        nil
       end
 
       # Nonces are kept per `state`, so two sign-ins started in one browser
